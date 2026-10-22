@@ -1,489 +1,689 @@
+"""Калькулятор логических функций (переписанная версия).
+
+Что исправлено по сравнению со старой версией:
+  * Убран небезопасный eval(): выражение разбирается полноценным
+    рекурсивным парсером (лексем + синтаксический анализ) и вычисляется
+    напрямую по AST.
+  * Корректная токенизация: многосимвольные имена переменных (abc, x1),
+    слова and/or/not/xor как операторы, а не наборы букв; поддержка
+    констант 0/1, true/false, истина/ложь.
+  * Строгая валидация: несбалансированные скобки, лишние операторы и
+    неизвестные символы приводят к понятной ошибке с указанием позиции.
+  * Исправлены приоритеты операторов: ¬ > ∧ > ∨ > ⊕ > → > ↔
+    (импликация правосторонняя, остальные — левосторонние).
+  * Алгоритм Квайна–Мак-Класки дополнен этапом выбора существенных
+    импликант + разрешением циклических таблиц методом Петрика
+    (теперь ДНФ действительно минимальна по числу литералов).
+  * Константные функции (0 и 1) больше не вызывают падения.
+"""
+
 import itertools
-from collections import defaultdict
-import re
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
 
+# ===========================================================================
+# Лексический анализ
+# ===========================================================================
+
+# Слова-операторы и много символьные стрелки (проверяются до имён переменных)
+KEYWORD_OPS = [
+    ('<=>', '↔'), ('<->', '↔'),
+    ('==>', '→'), ('->', '→'), ('=>', '→'),
+    ('xor', '⊕'), ('XOR', '⊕'),
+    ('and', '∧'), ('AND', '∧'),
+    ('or', '∨'), ('OR', '∨'),
+    ('not', '¬'), ('NOT', '¬'),
+]
+
+CONSTANT_TOKENS = {
+    'true': True, 'True': True, 'истина': True,
+    'false': False, 'False': False, 'ложь': False,
+}
+
+SIMPLE_OPS = {
+    '!': '¬', '~': '¬', '¬': '¬',
+    '&': '∧', '*': '∧', '∧': '∧',
+    '|': '∨', '+': '∨', '∨': '∨',
+    '⊕': '⊕', '≠': '⊕',
+    '→': '→', '⇒': '→',
+    '↔': '↔', '≡': '↔',
+    '(': '(', ')': ')',
+}
+
+
+class ParseError(ValueError):
+    """Ошибка разбора выражения с указанием позиции."""
+
+    def __init__(self, message, pos=None):
+        self.pos = pos
+        if pos is not None:
+            message = f"{message} (позиция {pos + 1})"
+        super().__init__(message)
+
+
+def tokenize(text):
+    """Разбивает строку на список лексем (kind, value, pos)."""
+    tokens = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+
+        # Многосимвольные операторы (стрелки и слова and/or/not/xor)
+        matched = False
+        for raw, norm in KEYWORD_OPS:
+            if text[i:i + len(raw)] == raw:
+                end = i + len(raw)
+                # слово 'and' не должно быть частью имени переменной (andy)
+                if raw[-1].isalpha() and end < n and (text[end].isalnum() or text[end] == '_'):
+                    continue
+                tokens.append(('op', norm, i))
+                i = end
+                matched = True
+                break
+        if matched:
+            continue
+
+        # Имена переменных: буква/подчёркивание + буквы/цифры/подчёркивания
+        if (ch.isalpha() and ch.isascii()) or ch == '_':
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == '_'):
+                j += 1
+            name = text[i:j]
+            if name in CONSTANT_TOKENS:
+                tokens.append(('const', CONSTANT_TOKENS[name], i))
+            else:
+                tokens.append(('var', name, i))
+            i = j
+            continue
+
+        # Отдельные символы-операторы
+        if ch in SIMPLE_OPS:
+            tokens.append(('op', SIMPLE_OPS[ch], i))
+            i += 1
+            continue
+
+        # Цифры: только 0/1 трактуются как константы (последовательность бит)
+        if ch.isdigit():
+            j = i
+            while j < n and text[j].isdigit():
+                j += 1
+            num = text[i:j]
+            if set(num) <= {'0', '1'}:
+                for d in num:
+                    tokens.append(('const', d == '1', i))
+            else:
+                raise ParseError(f"Неизвестный токен '{num}'", i)
+            i = j
+            continue
+
+        raise ParseError(f"Неизвестный символ '{ch}'", i)
+    return tokens
+
+
+# ===========================================================================
+# Синтаксический анализ (рекурсивный спуск)
+# AST: ('var', name) | ('const', bool) | ('not', x) | ('bin', op, l, r)
+# Приоритет (от низшего к высшему): ↔ , → , ⊕ , ∨ , ∧ , ¬
+# ===========================================================================
+
+class Parser:
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.i = 0
+
+    def peek(self):
+        return self.tokens[self.i] if self.i < len(self.tokens) else None
+
+    def parse(self):
+        node = self.parse_equiv()
+        if self.i != len(self.tokens):
+            tok = self.tokens[self.i]
+            raise ParseError(f"Лишний элемент '{tok[1]}'", tok[2])
+        return node
+
+    def parse_equiv(self):
+        node = self.parse_impl()
+        while (t := self.peek()) and t[0] == 'op' and t[1] == '↔':
+            self.i += 1
+            node = ('bin', '↔', node, self.parse_impl())
+        return node
+
+    def parse_impl(self):  # правосторонняя ассоциативность
+        node = self.parse_xor()
+        t = self.peek()
+        if t and t[0] == 'op' and t[1] == '→':
+            self.i += 1
+            right = self.parse_impl()
+            return ('bin', '→', node, right)
+        return node
+
+    def parse_xor(self):
+        node = self.parse_or()
+        while (t := self.peek()) and t[0] == 'op' and t[1] == '⊕':
+            self.i += 1
+            node = ('bin', '⊕', node, self.parse_or())
+        return node
+
+    def parse_or(self):
+        node = self.parse_and()
+        while (t := self.peek()) and t[0] == 'op' and t[1] == '∨':
+            self.i += 1
+            node = ('bin', '∨', node, self.parse_and())
+        return node
+
+    def parse_and(self):
+        node = self.parse_not()
+        while (t := self.peek()) and t[0] == 'op' and t[1] == '∧':
+            self.i += 1
+            node = ('bin', '∧', node, self.parse_not())
+        return node
+
+    def parse_not(self):
+        t = self.peek()
+        if t and t[0] == 'op' and t[1] == '¬':
+            self.i += 1
+            return ('not', self.parse_not())
+        return self.parse_atom()
+
+    def parse_atom(self):
+        t = self.peek()
+        if t is None:
+            last = self.tokens[-1][2] if self.tokens else 0
+            raise ParseError("Выражение неожиданно завершилось", last)
+        if t[0] == 'var':
+            self.i += 1
+            return ('var', t[1])
+        if t[0] == 'const':
+            self.i += 1
+            return ('const', t[1])
+        if t[0] == 'op' and t[1] == '(':
+            self.i += 1
+            node = self.parse_equiv()
+            close = self.peek()
+            if close is None or close[1] != ')':
+                raise ParseError("Несбалансированные скобки: ожидалась ')'",
+                                 close[2] if close else t[2])
+            self.i += 1
+            return node
+        raise ParseError(f"Ожидалось имя переменной, константа или '(' , получено '{t[1]}'", t[2])
+
+
+def collect_variables(node, acc):
+    kind = node[0]
+    if kind == 'var':
+        acc.add(node[1])
+    elif kind == 'not':
+        collect_variables(node[1], acc)
+    elif kind == 'bin':
+        collect_variables(node[2], acc)
+        collect_variables(node[3], acc)
+
+
+def evaluate(node, env):
+    kind = node[0]
+    if kind == 'var':
+        return env[node[1]]
+    if kind == 'const':
+        return node[1]
+    if kind == 'not':
+        return not evaluate(node[1], env)
+    op, left_node, right_node = node[1], node[2], node[3]
+    if op == '∧':
+        return evaluate(left_node, env) and evaluate(right_node, env)
+    if op == '∨':
+        return evaluate(left_node, env) or evaluate(right_node, env)
+    if op == '⊕':
+        return evaluate(left_node, env) != evaluate(right_node, env)
+    if op == '→':
+        return (not evaluate(left_node, env)) or evaluate(right_node, env)
+    if op == '↔':
+        return evaluate(left_node, env) == evaluate(right_node, env)
+    raise ParseError(f"Неизвестный оператор '{op}'")
+
+
+# ===========================================================================
+# Логическая функция: таблица истинности, СДНФ/СКНФ, минимизация
+# ===========================================================================
+
 class LogicFunction:
-    def __init__(self, variables=None, function=None, expression=None):
-        """Инициализация логической функции"""
-        if expression is not None:
-            self.parse_expression(expression)
-        else:
-            self.variables = variables
-            self.function = function
+    MAX_VARIABLES = 12
+
+    def __init__(self, expression):
+        self.original_expression = expression.strip()
+        tokens = tokenize(self.original_expression)
+        if not tokens:
+            raise ParseError("Пустое выражение")
+        self.ast = Parser(tokens).parse()
+
+        variables = set()
+        collect_variables(self.ast, variables)
+        self.variables = sorted(variables)
+
+        if len(self.variables) > self.MAX_VARIABLES:
+            raise ValueError(
+                f"Слишком много переменных ({len(self.variables)}). "
+                f"Максимум {self.MAX_VARIABLES}: таблица истинности заняла бы "
+                f"более {2 ** self.MAX_VARIABLES} строк."
+            )
 
         self.truth_table = []
-        self.minterms = []
+        self.minterms = []   # списки битов (0/1) в порядке self.variables
         self.maxterms = []
+        self._table_built = False
 
-    def parse_expression(self, expression):
-        """Парсинг логического выражения из строки"""
-        self.original_expression = expression
-
-        variables = sorted(list(set(re.findall(r'[a-zA-Z]', self.original_expression))))
-        self.variables = variables
-
-        py_expr = self.convert_to_python(expression)
-
-        func_str = f"lambda {', '.join(variables)}: {py_expr}"
-        try:
-            self.function = eval(func_str)
-        except Exception as e:
-            raise ValueError(f"Ошибка создания функции: {e}")
-
-    def convert_to_python(self, expr):
-        """Преобразование логического выражения в Python выражение"""
-        # Удаляем пробелы
-        expr = expr.replace(' ', '')
-
-        # Заменяем операторы на временные метки для удобства парсинга
-        expr = (expr.replace('->', '→')
-                .replace('=>', '→')
-                .replace('<->', '↔')
-                .replace('<=>', '↔')
-                .replace('¬', '!')
-                .replace('~', '!')
-                .replace('&', '∧')
-                .replace('*', '∧')
-                .replace('|', '∨')
-                .replace('+', '∨'))
-
-        # Обрабатываем выражение рекурсивно
-        return self.parse_recursive(expr)
-
-    def parse_recursive(self, expr):
-        """Рекурсивный парсинг выражения"""
-        if not expr:
-            return ""
-
-        # Убираем внешние скобки
-        expr = self.strip_outer_parentheses(expr)
-
-        # Находим оператор с наименьшим приоритетом
-        pos = self.find_operator_position(expr)
-
-        if pos != -1:
-            operator = expr[pos]
-            left = expr[:pos]
-            right = expr[pos + 1:]
-
-            if operator == '→':  # Импликация
-                left_parsed = self.parse_recursive(left)
-                right_parsed = self.parse_recursive(right)
-                return f"(not ({left_parsed}) or ({right_parsed}))"
-
-            elif operator == '↔':  # Эквивалентность
-                left_parsed = self.parse_recursive(left)
-                right_parsed = self.parse_recursive(right)
-                return f"(({left_parsed}) and ({right_parsed})) or (not ({left_parsed}) and not ({right_parsed}))"
-
-            elif operator == '∨':  # OR
-                left_parsed = self.parse_recursive(left)
-                right_parsed = self.parse_recursive(right)
-                return f"(({left_parsed}) or ({right_parsed}))"
-
-            elif operator == '∧':  # AND
-                left_parsed = self.parse_recursive(left)
-                right_parsed = self.parse_recursive(right)
-                return f"(({left_parsed}) and ({right_parsed}))"
-
-            elif operator == '⊕':  # XOR
-                left_parsed = self.parse_recursive(left)
-                right_parsed = self.parse_recursive(right)
-                return f"(({left_parsed}) ^ ({right_parsed}))"
-
-        # Обработка отрицания
-        if expr.startswith('!'):
-            inner = self.parse_recursive(expr[1:])
-            return f"not ({inner})"
-
-        if re.match(r'^[a-zA-Z]+$', expr):
-            return expr
-
-        if expr.startswith('(') and expr.endswith(')'):
-            return self.parse_recursive(expr[1:-1])
-
-        return expr
-
-    def strip_outer_parentheses(self, expr):
-        """Удаление внешних парных скобок"""
-        if expr.startswith('(') and expr.endswith(')'):
-            count = 0
-            for i, char in enumerate(expr):
-                if char == '(':
-                    count += 1
-                elif char == ')':
-                    count -= 1
-                    if count == 0 and i < len(expr) - 1:
-                        return expr
-            return expr[1:-1]
-        return expr
-
-    def find_operator_position(self, expr):
-        """Нахождение позиции оператора с наименьшим приоритетом"""
-        parentheses_count = 0
-        min_priority = float('inf')
-        result_pos = -1
-
-        # Приоритет операторов
-        priorities = {
-            '→': 1,
-            '↔': 2,
-            '∨': 3,
-            '⊕': 4,
-            '∧': 5,
-        }
-
-        for i, char in enumerate(expr):
-            if char == '(':
-                parentheses_count += 1
-            elif char == ')':
-                parentheses_count -= 1
-            elif parentheses_count == 0 and char in priorities:
-                priority = priorities[char]
-                if priority < min_priority:
-                    min_priority = priority
-                    result_pos = i
-
-        return result_pos
-
+    # ------------------------------------------------------------------
     def build_truth_table(self):
-        """Построение таблицы истинности"""
-        if not hasattr(self, 'variables') or not self.variables:
-            return None
-
+        if self._table_built:
+            return self.truth_table
         n = len(self.variables)
-        self.truth_table = []
-        self.minterms = []
-        self.maxterms = []
-
-        # Генерируем все возможные комбинации значений переменных
+        self.truth_table, self.minterms, self.maxterms = [], [], []
         for values in itertools.product([0, 1], repeat=n):
+            env = dict(zip(self.variables, map(bool, values)))
+            result = 1 if evaluate(self.ast, env) else 0
             row = dict(zip(self.variables, values))
-            try:
-                # Преобразуем 0/1 в False/True для вычисления функции
-                bool_values = {k: bool(v) for k, v in row.items()}
-                result = self.function(**bool_values)
-                # Преобразуем результат обратно в 0/1
-                result_int = 1 if result else 0
-                row['result'] = result_int
-                self.truth_table.append(row)
-
-                if result_int == 1:
-                    self.minterms.append(values)
-                else:
-                    self.maxterms.append(values)
-            except Exception as e:
-                print(f"Ошибка при вычислении функции: {e}")
-                return None
-
+            row['result'] = result
+            self.truth_table.append(row)
+            (self.minterms if result else self.maxterms).append(list(values))
+        self._table_built = True
         return self.truth_table
 
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _bits_to_index(bits):
+        idx = 0
+        for b in bits:
+            idx = (idx << 1) | int(b)
+        return idx
+
+    # ------------------------------------------------------------------
     def get_truth_table_text(self):
-        """Получение таблицы истинности в виде текста"""
-        if not self.truth_table:
-            if self.build_truth_table() is None:
-                return "Ошибка при построении таблицы истинности"
+        self.build_truth_table()
+        rows = self.truth_table
+        if not rows:
+            val = self.get_sdnf()
+            return f"Переменных нет — выражение является константой: F ≡ {val}"
+        headers = self.variables + ['F']
+        widths = [max(len(h), 3) for h in headers]
+        sep = '-+-'.join('-' * w for w in widths)
+        lines = [sep,
+                 ' | '.join(h.ljust(w) for h, w in zip(headers, widths)),
+                 sep]
+        for row in rows:
+            cells = [str(row[v]).ljust(w) for v, w in zip(self.variables, widths)]
+            cells.append(str(row['result']).ljust(widths[-1]))
+            lines.append(' | '.join(cells))
+        lines.append(sep)
+        ones = sum(r['result'] for r in rows)
+        one_idx = ', '.join(str(i) for i, r in enumerate(rows) if r['result']) or '—'
+        lines.append(f"Единиц: {ones} из {len(rows)}   (номера наборов с F=1: {one_idx})")
+        return '\n'.join(lines)
 
-        text = "Таблица истинности:\n"
-        # Заголовок
-        header = " | ".join(self.variables) + " | result"
-        text += header + "\n"
-        text += "-" * len(header) + "\n"
-
-        # Данные
-        for row in self.truth_table:
-            values = [str(row[var]) for var in self.variables]
-            text += " | ".join(values) + f" | {row['result']}\n"
-
-        return text
-
+    # ------------------------------------------------------------------
     def get_sdnf(self):
-        """Построение СДНФ (Совершенной дизъюнктивной нормальной формы)"""
+        self.build_truth_table()
         if not self.minterms:
-            if self.build_truth_table() is None:
-                return "Ошибка"
-
-        if not self.minterms:
-            return "0"
-
+            return '0'
+        if not self.maxterms:
+            return '1'
         terms = []
-        for values in self.minterms:
-            term_parts = []
-            for var, val in zip(self.variables, values):
-                if val == 1:
-                    term_parts.append(var)
-                else:
-                    term_parts.append(f"¬{var}")
-            terms.append(" & ".join(term_parts))
-
-        return " | ".join(f"({term})" for term in terms)
+        for bits in self.minterms:
+            parts = [var if val == 1 else f"¬{var}"
+                     for var, val in zip(self.variables, bits)]
+            terms.append('(' + ' & '.join(parts) + ')')
+        return ' ∨ '.join(terms)
 
     def get_sknf(self):
-        """Построение СКНФ (Совершенной конъюнктивной нормальной формы)"""
+        self.build_truth_table()
         if not self.maxterms:
-            if self.build_truth_table() is None:
-                return "Ошибка"
-
-        if not self.maxterms:
-            return "1"  # функция всегда истинна
-
-        terms = []
-        for values in self.maxterms:
-            term_parts = []
-            for var, val in zip(self.variables, values):
-                if val == 0:
-                    term_parts.append(var)
-                else:
-                    term_parts.append(f"¬{var}")
-            terms.append(" | ".join(term_parts))
-
-        return " & ".join(f"({term})" for term in terms)
-
-    def quine_mccluskey(self):
-        """Алгоритм Квайна-Мак-Класки для минимизации ДНФ"""
+            return '1'
         if not self.minterms:
-            if self.build_truth_table() is None:
-                return "Ошибка"
+            return '0'
+        clauses = []
+        for bits in self.maxterms:
+            parts = [var if val == 0 else f"¬{var}"
+                     for var, val in zip(self.variables, bits)]
+            clauses.append('(' + ' ∨ '.join(parts) + ')')
+        return ' ∧ '.join(clauses)
 
-        if not self.minterms:
-            return "0"
+    # ------------------------------------------------------------------
+    # Квинн–Мак-Класки + выбор существенных импликант + метод Петрика
+    # ------------------------------------------------------------------
+    def prime_implicants(self):
+        """Возвращает (primes, minterm_indices).
+        primes: список ((mask, pattern), covered_set), где mask — битовая
+        маска значащих разрядов, pattern — их значения (старший разряд =
+        первая переменная)."""
+        self.build_truth_table()
+        minterm_indices = [self._bits_to_index(b) for b in self.minterms]
+        # терм хранится как (mask, pattern): бит mask=1 означает, что переменная
+        # в конъюнкции НЕ участвует ('-'), pattern задаёт значения значащих
+        # разрядов (старший разряд = первая переменная).
+        n = len(self.variables)
+        full = (1 << n) - 1
 
-        # Преобразуем минтермы в бинарные строки в правильном порядке переменных
-        minterm_strings = []
-        for minterm in self.minterms:
-            # Создаем словарь значение-переменная для правильного порядка
-            minterm_dict = dict(zip(self.variables, minterm))
-            # Формируем строку в правильном порядке переменных
-            binary_str = ''.join(str(minterm_dict[var]) for var in self.variables)
-            minterm_strings.append(binary_str)
+        def ones_count(x):
+            c = 0
+            while x:
+                x &= x - 1
+                c += 1
+            return c
 
-        # Группируем по количеству единиц
-        groups = defaultdict(list)
-        for minterm in minterm_strings:
-            ones = minterm.count('1')
-            groups[ones].append((minterm, [int(minterm, 2)]))
-
-        # Функция для сравнения двух термов
-        def can_combine(term1, term2):
-            diff_count = 0
-            result = []
-            for a, b in zip(term1[0], term2[0]):
-                if a != b:
-                    diff_count += 1
-                    result.append('-')
-                else:
-                    result.append(a)
-            return diff_count == 1, ''.join(result)
-
-        # Основной цикл алгоритма
-        all_prime_implicants = []
-        while True:
-            new_groups = defaultdict(list)
+        current = {(full, m): {m} for m in minterm_indices}
+        primes = {}
+        while current:
+            next_level = {}
             used = set()
+            keys = list(current.keys())
+            for a in range(len(keys)):
+                mask_a, pat_a = keys[a]
+                for b in range(a + 1, len(keys)):
+                    mask_b, pat_b = keys[b]
+                    if mask_a != mask_b:
+                        continue
+                    diff = pat_a ^ pat_b
+                    if diff == 0 or ones_count(diff) != 1:
+                        continue
+                    new_mask = mask_a & ~diff   # differing bit становится '-'
+                    new_pattern = pat_a & new_mask
+                    key = (new_mask, new_pattern)
+                    merged = next_level.setdefault(key, set())
+                    merged |= current[keys[a]] | current[keys[b]]
+                    used.add(keys[a])
+                    used.add(keys[b])
+            for key, covered in current.items():
+                if key not in used:
+                    primes[key] = covered
+            current = next_level
 
-            for ones in sorted(groups.keys()):
-                if ones + 1 in groups:
-                    for term1 in groups[ones]:
-                        for term2 in groups[ones + 1]:
-                            combinable, combined = can_combine(term1, term2)
-                            if combinable:
-                                new_minterms = sorted(list(set(term1[1] + term2[1])))
-                                new_groups[ones].append((combined, new_minterms))
-                                used.add(term1[0])
-                                used.add(term2[0])
+        return list(primes.items()), minterm_indices
 
-            # Добавляем непокрытые простые импликанты
-            for ones in groups:
-                for term in groups[ones]:
-                    if term[0] not in used:
-                        all_prime_implicants.append(term)
+    def get_min_dnf(self):
+        self.build_truth_table()
+        if not self.minterms:
+            return '0\n  (функция тождественно ложна)'
+        if not self.maxterms:
+            return '1\n  (функция тождественно истинна)'
 
-            if not new_groups:
-                break
+        primes, minterm_indices = self.prime_implicants()
+        mset = set(minterm_indices)
+        cover_sets = [frozenset(covered & mset) for (_key, covered) in primes]
 
-            groups = new_groups
+        # --- существенные импликанты ---
+        essential = set()
+        covered_by_essential = set()
+        for idx in minterm_indices:
+            holders = [i for i, cs in enumerate(cover_sets) if idx in cs]
+            if len(holders) == 1:
+                e = holders[0]
+                if e not in essential:
+                    essential.add(e)
+                    covered_by_essential |= cover_sets[e]
 
-        # Добавляем оставшиеся импликанты из последней группы
-        for ones in groups:
-            for term in groups[ones]:
-                all_prime_implicants.append(term)
+        remaining = [i for i in range(len(cover_sets)) if i not in essential]
+        uncovered = mset - covered_by_essential
+        chosen = set(essential)
 
-        # Удаляем дубликаты
-        unique_implicants = []
-        seen = set()
-        for implicant in all_prime_implicants:
-            if implicant[0] not in seen:
-                unique_implicants.append(implicant)
-                seen.add(implicant[0])
+        if uncovered:
+            # --- метод Петрика для циклического остатка ---
+            products = []
+            for idx in sorted(uncovered):
+                clause = tuple(sorted(i for i in remaining if idx in cover_sets[i]))
+                if clause:
+                    products.append([clause])
 
-        # Преобразуем простые импликанты в читаемый вид с правильным порядком переменных
-        minimized_terms = []
-        for implicant in unique_implicants:
-            term_parts = []
-            # Сопоставляем каждый символ импликанта с соответствующей переменной
-            for var, char in zip(self.variables, implicant[0]):
-                if char == '1':
-                    term_parts.append(var)
-                elif char == '0':
-                    term_parts.append(f"¬{var}")
-                # '-' пропускаем (переменная отсутствует в импликанте)
-            if term_parts:  # проверка на случай, если все переменные '-'
-                minimized_terms.append(" & ".join(term_parts))
+            candidates = list(products[0]) if products else []
+            for prod in products[1:]:
+                merged_all = {frozenset(c) | frozenset(q)
+                              for c in candidates for q in prod}
+                uniq = sorted(merged_all, key=len)
+                minimal = []
+                for s in uniq:  # убираем поглощённые супермножества
+                    if not any(m <= s and m != s for m in minimal):
+                        minimal.append(s)
+                candidates = minimal
 
-        return " | ".join(minimized_terms) if minimized_terms else "1"
+            def literal_count(term_idx):
+                mask, _pattern = primes[term_idx][0]
+                return bin(mask).count('1')
+
+            best, best_cost = None, None
+            for sol in candidates:
+                cost = sum(literal_count(i) for i in sol)
+                if best_cost is None or cost < best_cost:
+                    best_cost, best = cost, sol
+            if best is not None:
+                chosen.update(best)
+
+        # --- сборка текста ДНФ ---
+        terms = []
+        for i in sorted(chosen):
+            mask, pattern = primes[i][0]
+            parts = []
+            for k, var in enumerate(self.variables):
+                bit_pos = len(self.variables) - 1 - k
+                if mask & (1 << bit_pos):
+                    parts.append(var if (pattern >> bit_pos) & 1 else f"¬{var}")
+            terms.append((' & '.join(parts) if parts else '1', len(parts), pattern))
+        terms.sort(key=lambda t: (t[1], t[2]))
+        dnf = ' ∨ '.join(t[0] for t in terms)
+        lits = sum(t[1] for t in terms)
+        note = (f"  ({len(terms)} конъюнкций, {lits} литералов; "
+                f"покрыто все {len(self.minterms)} единиц таблицы)")
+        return dnf + '\n' + note
+
+
+# ===========================================================================
+# Графический интерфейс
+# ===========================================================================
+
+BG_MAIN = '#101826'      # тёмно-синий фон окна
+BG_PANEL = '#182338'     # панели-секции
+BG_FIELD = '#0c1220'     # поля ввода/вывода
+FG_MAIN = '#e8eef7'      # основной текст
+FG_MUTED = '#8fa3bf'     # приглушённый текст
+FG_ACCENT = '#4fc3f7'    # акцент (голубой)
+FG_OK = '#81c784'        # зелёный
+FG_WARN = '#ffb74d'      # оранжевый
+FG_ERR = '#e57373'       # красный
+FONT_UI = ('Segoe UI', 10)
+FONT_TITLE = ('Segoe UI', 17, 'bold')
+FONT_MONO = ('Consolas', 10)
 
 
 class LogicCalculatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Калькулятор логических функций")
-        self.root.geometry("900x750")
-        self.root.configure(bg='black')
+        root.title('Калькулятор логических функций')
+        root.geometry('980x780')
+        root.minsize(760, 560)
+        root.configure(bg=BG_MAIN)
 
-        self.setup_ui()
+        style = ttk.Style(root)
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
 
-    def setup_ui(self):
-        """Создание интерфейса"""
-        # Основной фрейм
-        main_frame = tk.Frame(self.root, bg='black', padx=10, pady=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        self._build_ui()
 
-        # Заголовок
-        title_label = tk.Label(main_frame,
-                               text="Калькулятор логических функций",
-                               bg='black',
-                               fg='white',
-                               font=("Arial", 16, "bold"))
-        title_label.pack(pady=(0, 20))
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        outer = tk.Frame(self.root, bg=BG_MAIN, padx=14, pady=12)
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        # Инструкция
-        instruction_text = (
-            "Поддерживаемые операторы:\n"
-            "AND: &, *, and\n"
-            "OR: |, +, or\n"
-            "NOT: !, ¬, ~, not\n"
-            "XOR: ⊕\n"
-            "Импликация: →, ->, =>\n"
-            "Эквивалентность: ↔, <->, <=>\n"
-            "Скобки: (, )\n\n"
-            "Примеры выражений:\n"
-            "x → y, x ↔ y, (x & y) → z\n"
-            "!(x & y), ¬(a | b), (!z + y) → (!z ⊕ !x)"
-        )
-        instruction_label = tk.Label(main_frame,
-                                     text=instruction_text,
-                                     justify=tk.LEFT,
-                                     bg='black',
-                                     fg='white',
-                                     font=("Arial", 10))
-        instruction_label.pack(pady=(0, 10), anchor='w')
+        header = tk.Frame(outer, bg=BG_MAIN)
+        header.pack(fill=tk.X)
+        tk.Label(header, text='⚡ Калькулятор логических функций',
+                 font=FONT_TITLE, fg=FG_ACCENT, bg=BG_MAIN).pack(side=tk.LEFT)
+        tk.Label(header, text='Таблица истинности · СДНФ · СКНФ · Мин. ДНФ',
+                 font=('Segoe UI', 9), fg=FG_MUTED, bg=BG_MAIN).pack(side=tk.RIGHT)
 
-        # Фрейм для поля ввода
-        input_frame = tk.Frame(main_frame, bg='black')
-        input_frame.pack(fill=tk.X, pady=(10, 5))
+        # --- панель ввода ---
+        input_panel = tk.LabelFrame(outer, text=' Выражение ',
+                                    font=FONT_UI, fg=FG_MAIN, bg=BG_PANEL,
+                                    bd=1, relief=tk.SOLID, padx=10, pady=8)
+        input_panel.pack(fill=tk.X, pady=(12, 8))
 
-        # Метка для поля ввода
-        input_label = tk.Label(input_frame,
-                               text="Введите логическое выражение:",
-                               bg='black',
-                               fg='white',
-                               font=("Arial", 10))
-        input_label.pack(anchor='w')
+        row = tk.Frame(input_panel, bg=BG_PANEL)
+        row.pack(fill=tk.X)
+        self.expression_var = tk.StringVar(value='(¬A ∨ B) ∧ (A → ¬C)')
+        entry = tk.Entry(row, textvariable=self.expression_var,
+                         font=('Consolas', 12), bg=BG_FIELD, fg=FG_MAIN,
+                         insertbackground=FG_ACCENT, relief=tk.FLAT,
+                         highlightthickness=1, highlightbackground='#2c3e5c',
+                         highlightcolor=FG_ACCENT)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4)
+        entry.bind('<Return>', lambda e: self.calculate())
 
-        # Поле ввода выражения
-        self.expression_var = tk.StringVar()
-        self.expression_entry = tk.Entry(input_frame,
-                                         textvariable=self.expression_var,
-                                         width=60,
-                                         bg='gray20',
-                                         fg='white',
-                                         insertbackground='white',
-                                         font=("Arial", 10))
-        self.expression_entry.pack(fill=tk.X, pady=(5, 0))
-        self.expression_entry.bind('<Return>', lambda e: self.calculate())
+        tk.Button(row, text='  Рассчитать  ', command=self.calculate,
+                  font=('Segoe UI', 10, 'bold'), bg=FG_ACCENT, fg='#06283d',
+                  activebackground='#81d4fa', activeforeground='#06283d',
+                  relief=tk.FLAT, cursor='hand2', bd=0, padx=8, pady=3
+                  ).pack(side=tk.LEFT, padx=(8, 0))
 
-        # Кнопка расчета
-        self.calculate_button = tk.Button(main_frame,
-                                          text="Рассчитать",
-                                          command=self.calculate,
-                                          bg='gray30',
-                                          fg='white',
-                                          font=("Arial", 10),
-                                          relief=tk.RAISED,
-                                          bd=2)
-        self.calculate_button.pack(pady=10)
+        tk.Button(row, text=' Примеры ▾', command=self._show_examples,
+                  font=FONT_UI, bg='#243450', fg=FG_MAIN,
+                  activebackground='#2f4468', activeforeground=FG_MAIN,
+                  relief=tk.FLAT, cursor='hand2', bd=0, padx=8, pady=3
+                  ).pack(side=tk.LEFT, padx=(6, 0))
 
-        # Область вывода результатов
+        tk.Label(input_panel,
+                 text=('Операторы:  НЕ: ! ~ ¬ not   И: & * ∧ and   ИЛИ: | + ∨ or   '
+                       'ИСКЛ.ИЛИ: ⊕ xor   IMPL: -> => →   EQUIV: <-> <=> ≡ ↔   '
+                       'скобки ( )   константы: 0 1 true false'),
+                 font=('Segoe UI', 8), fg=FG_MUTED, bg=BG_PANEL,
+                 anchor='w', justify=tk.LEFT).pack(fill=tk.X, pady=(6, 0))
+
+        # --- панель результатов ---
+        result_panel = tk.LabelFrame(outer, text=' Результаты ',
+                                     font=FONT_UI, fg=FG_MAIN, bg=BG_PANEL,
+                                     bd=1, relief=tk.SOLID, padx=6, pady=6)
+        result_panel.pack(fill=tk.BOTH, expand=True)
+
         self.result_text = scrolledtext.ScrolledText(
-            main_frame,
-            width=90,
-            height=30,
-            wrap=tk.WORD,
-            font=("Courier New", 10),
-            bg='black',
-            fg='white',
-            insertbackground='white',
-            selectbackground='gray40'
-        )
-        self.result_text.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+            result_panel, wrap=tk.NONE, font=FONT_MONO,
+            bg=BG_FIELD, fg=FG_MAIN, relief=tk.FLAT,
+            insertbackground=FG_MAIN, selectbackground='#2f4468',
+            highlightthickness=1, highlightbackground='#2c3e5c',
+            highlightcolor=FG_ACCENT, padx=10, pady=8)
+        self.result_text.pack(fill=tk.BOTH, expand=True)
+        self.result_text.tag_configure('section', foreground=FG_ACCENT,
+                                       font=('Consolas', 10, 'bold'))
+        self.result_text.tag_configure('ok', foreground=FG_OK)
+        self.result_text.tag_configure('warn', foreground=FG_WARN)
+        self.result_text.tag_configure('err', foreground=FG_ERR,
+                                       font=('Consolas', 10, 'bold'))
+        self.result_text.configure(state=tk.DISABLED)
 
-        # Статус бар
-        self.status_var = tk.StringVar(value="Готов к работе")
-        status_bar = tk.Label(main_frame,
-                              textvariable=self.status_var,
-                              relief=tk.SUNKEN,
-                              bg='gray20',
-                              fg='white',
-                              font=("Arial", 9))
-        status_bar.pack(fill=tk.X, pady=(10, 0))
+        # --- статус ---
+        self.status_var = tk.StringVar(value='Готов. Введите выражение и нажмите Enter.')
+        tk.Label(outer, textvariable=self.status_var, anchor='w',
+                 font=('Segoe UI', 9), fg=FG_MUTED, bg='#0b111d',
+                 relief=tk.SUNKEN, bd=1, padx=8, pady=3).pack(fill=tk.X, pady=(8, 0))
+
+    # ------------------------------------------------------------------
+    def _show_examples(self):
+        win = tk.Toplevel(self.root)
+        win.title('Примеры выражений')
+        win.configure(bg=BG_PANEL, padx=10, pady=10)
+        examples = [
+            '(¬A ∨ B) ∧ (A → ¬C)',
+            'x -> y',
+            'a <-> b',
+            '(a & b) -> c',
+            '!(z & y) ∨ (x ⊕ z)',
+            'not (x or y) and z',
+            'a ⊕ b ⊕ c',
+            'x1 & x2 | !x1 & x3',
+            '0',
+            '1',
+        ]
+        tk.Label(win, text='Кликните пример, чтобы подставить его и рассчитать:',
+                 font=FONT_UI, fg=FG_MAIN, bg=BG_PANEL).pack(anchor='w')
+        for ex in examples:
+            b = tk.Button(win, text=ex, anchor='w', justify=tk.LEFT,
+                          font=('Consolas', 10), bg=BG_FIELD, fg=FG_ACCENT,
+                          activebackground='#2f4468', activeforeground=FG_MAIN,
+                          relief=tk.FLAT, cursor='hand2', bd=0, padx=8, pady=4)
+            b.pack(fill=tk.X, pady=2)
+            b.configure(command=lambda t=ex: (self.expression_var.set(t),
+                                              win.destroy(),
+                                              self.calculate()))
+
+    # ------------------------------------------------------------------
+    def _write(self, text, tags=()):
+        self.result_text.configure(state=tk.NORMAL)
+        self.result_text.insert(tk.END, text + '\n', tags)
+        self.result_text.configure(state=tk.DISABLED)
 
     def calculate(self):
-        """Обработка расчета"""
         expression = self.expression_var.get().strip()
-
         if not expression:
-            messagebox.showwarning("Предупреждение", "Пожалуйста, введите логическое выражение")
+            messagebox.showwarning('Пусто', 'Введите логическое выражение.')
             return
 
+        self.status_var.set('Вычисление…')
+        self.root.update_idletasks()
+
         try:
-            self.status_var.set("Вычисление...")
-            self.root.update()
+            lf = LogicFunction(expression)
+        except ParseError as e:
+            self._render_error(expression, str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            self._render_error(expression, f'{type(e).__name__}: {e}')
+            return
 
-            # Создаем объект логической функции
-            lf = LogicFunction(expression=expression)
+        self.result_text.configure(state=tk.NORMAL)
+        self.result_text.delete('1.0', tk.END)
+        self.result_text.configure(state=tk.DISABLED)
 
-            # Формируем результат
-            result_text = f"Анализ выражения: {expression}\n"
-            result_text += f"Обнаруженные переменные: {', '.join(lf.variables)}\n\n"
+        self._write(f'Исходное выражение:  {lf.original_expression}', ('section',))
+        vars_line = ', '.join(lf.variables) if lf.variables else '— (нет переменных)'
+        self._write(f'Переменные ({len(lf.variables)}):  {vars_line}\n')
 
-            # Таблица истинности
-            result_text += lf.get_truth_table_text() + "\n"
+        lf.build_truth_table()
+        self._write('┌─ Таблица истинности ─────────────────────────────', ('section',))
+        if lf.truth_table:
+            self._write(lf.get_truth_table_text(), ('ok',))
+        else:
+            self._write(f'Выражение — константа: F ≡ {lf.get_sdnf()}', ('warn',))
 
-            # Различные формы
-            result_text += "Совершенная дизъюнктивная нормальная форма (СДНФ):\n"
-            result_text += lf.get_sdnf() + "\n\n"
+        self._write('\n┌─ СДНФ (совершенная дизъюнктивная нормальная форма)', ('section',))
+        self._write(lf.get_sdnf())
 
-            result_text += "Совершенная конъюнктивная нормальная форма (СКНФ):\n"
-            result_text += lf.get_sknf() + "\n\n"
+        self._write('\n┌─ СКНФ (совершенная конъюнктивная нормальная форма)', ('section',))
+        self._write(lf.get_sknf())
 
-            result_text += "Минимальная ДНФ:\n"
-            result_text += lf.quine_mccluskey() + "\n"
+        self._write('\n┌─ Минимальная ДНФ (Квинн–Мак-Класки + Петрик)', ('section',))
+        self._write(lf.get_min_dnf(), ('ok',))
 
-            # Выводим результат
-            self.result_text.delete(1.0, tk.END)
-            self.result_text.insert(1.0, result_text)
+        self.status_var.set(f'Готово: переменных {len(lf.variables)}, '
+                            f'наборов {len(lf.truth_table)}.')
 
-            self.status_var.set("Расчет завершен успешно")
-
-        except Exception as e:
-            error_msg = f"Ошибка: {str(e)}\nПроверьте правильность введенного выражения"
-            self.result_text.delete(1.0, tk.END)
-            self.result_text.insert(1.0, error_msg)
-            self.status_var.set("Ошибка при расчете")
-            messagebox.showerror("Ошибка", f"Не удалось обработать выражение:\n{str(e)}")
+    def _render_error(self, expression, message):
+        self.result_text.configure(state=tk.NORMAL)
+        self.result_text.delete('1.0', tk.END)
+        self._write(f'Исходное выражение:  {expression}', ('section',))
+        self._write('✖ Не удалось разобрать выражение', ('err',))
+        self._write(message, ('err',))
+        if 'позиция' in message:
+            try:
+                pos = int(message.rsplit('позиция', 1)[1].strip(' ()')) - 1
+                if 0 <= pos < len(expression):
+                    marked = expression[:pos] + '▸' + expression[pos:]
+                    self._write(f'    {marked}', ('warn',))
+            except ValueError:
+                pass
+        self._write('\nПодсказка: проверьте скобки и операторы.\n'
+                    'Примеры корректных записей:  (a & b) -> c ;  ¬x ∨ y ;  a ⊕ b ⊕ c',
+                    ('warn',))
+        self.result_text.configure(state=tk.DISABLED)
+        self.status_var.set('Ошибка разбора выражения')
 
 
 def main():
@@ -492,5 +692,5 @@ def main():
     root.mainloop()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
